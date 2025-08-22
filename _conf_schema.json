@@ -1,0 +1,34 @@
+{
+    "max_retries": {
+        "type": "int",
+        "description": "最大重试次数",
+        "hint": "当插件检测到可重试的错误时，重新请求的最大次数。",
+        "default": 10
+    },
+    "retry_delay": {
+        "type": "int",
+        "description": "重试间隔时间 (秒)",
+        "hint": "每次重试之间的初始等待时间。如果开启了指数退避模式，这个时间会在此基础上翻倍。",
+        "default": 1
+    },
+    "retry_delay_mode": {
+        "type": "bool",
+        "description": "开启指数退避模式",
+        "hint": "开启后 (true)，重试间隔会依次翻倍，最大间隔十秒，以应对不稳定的API。\n关闭后 (false)，将使用固定的重试间隔。",
+        "default": true
+    },
+    "retry_keywords": {
+        "type": "list",
+        "description": "触发重试的错误关键词",
+        "hint": "当初始请求失败时，如果返回的错误消息包含列表中的任何一个关键词，插件将启动重试。不区分大小写。输入一个词后按回车保存。",
+        "default": [
+            "API 返回的内容为空"
+        ]
+    },
+    "fallback_reply": {
+        "type": "text",
+        "description": "最终失败后的回复",
+        "hint": "当所有重试次数都用尽后，发送给用户的最终提示消息。您可以使用 {reason} 作为占位符来显示失败原因。",
+        "default": "抱歉，请求多次失败({reason})，请稍后再试。"
+    }
+}
