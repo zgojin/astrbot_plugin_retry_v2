@@ -26,14 +26,14 @@ class FinalLLMRetryPlugin(Star):
         self.retry_delay = self.config.get("retry_delay", 2)
         self.use_exponential_backoff = self.config.get("retry_delay_mode", True)
         self.fallback_reply = self.config.get(
-            "fallback_reply", "抱歉，请求多次失败({reason})，请稍后再试。"
+            "fallback_reply", "抱歉，请求多次失败({reason})，请稍后再试"
         )
 
         default_keywords = [
             "API 返回的内容为空",
         ]
         self.retry_keywords = self.config.get("retry_keywords", default_keywords)
-        logger.info("astrbot_plugin_retry_v2 [v8.2.0] 全配置版已加载。")
+        logger.info("astrbot_plugin_retry_v2已加载")
 
     def _get_request_key(self, event: AstrMessageEvent) -> str:
         """获取用于追踪请求的唯一ID"""
@@ -46,39 +46,43 @@ class FinalLLMRetryPlugin(Star):
 
     @filter.on_llm_request()
     async def store_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """备份原始请求。"""
+        """备份原始请求"""
         key = self._get_request_key(event)
         self.pending_requests[key] = req
-        logger.debug(f"[FinalRetryPlugin] 已成功备份请求 (Key: {key})")
+        logger.debug(f"已成功备份请求 (Key: {key})")
 
     @filter.after_message_sent(priority=-100)
     async def cleanup_after_sent(self, event: AstrMessageEvent):
-        """当消息成功发送后，清理对应的请求备份，防止内存泄漏。"""
+        """当消息成功发送后，清理对应的请求备份，防止内存泄漏"""
         key = self._get_request_key(event)
         if key in self.pending_requests:
             self.pending_requests.pop(key)
-            logger.debug(
-                f"[FinalRetryPlugin] 请求已成功处理并发送，清理备份 (Key: {key})"
-            )
+            logger.debug(f"请求已成功处理并发送，清理备份 (Key: {key})")
 
     def _is_response_failed(self, resp: LLMResponse) -> tuple[bool, str]:
-        """检查LLM响应是否失败。"""
+        """检查LLM响应是否失败"""
         if not resp or not resp.completion_text:
-            return True, "内容为空"
+            return True, "返回内容为空"
 
-        finish_reason = None
-        if (
-            hasattr(resp, "raw_completion")
-            and hasattr(resp.raw_completion, "choices")
-            and resp.raw_completion.choices
-        ):
+        try:
+            # 尝试获取finish_reason
             finish_reason = resp.raw_completion.choices[0].finish_reason
-            if finish_reason and finish_reason.lower() not in NORMAL_FINISH_REASONS:
-                return True, f"完成原因异常({finish_reason})"
+        except (AttributeError, IndexError):
+            # 捕获异常，说明finish_reason字段缺失，视为失败
+            return True, "finish_reason缺失"
+
+        # 如果字段存在，但值为null(None)，也视为失败
+        if finish_reason is None:
+            return True, "finish_reason为空"
+
+        # 原有逻辑：检查finish_reason的值是否在正常列表中
+        if finish_reason.lower() not in NORMAL_FINISH_REASONS:
+            return True, f"finish_reason异常({finish_reason})"
+
         return False, ""
 
     async def _perform_retry(self, original_req: ProviderRequest) -> LLMResponse:
-        """执行一次LLM请求。"""
+        """执行一次LLM请求"""
         return await self.context.get_using_provider().text_chat(
             prompt=original_req.prompt,
             contexts=original_req.contexts,
@@ -93,10 +97,10 @@ class FinalLLMRetryPlugin(Star):
         original_req: ProviderRequest,
         initial_reason: str,
     ) -> tuple[bool, LLMResponse | None]:
-        """封装的重试循环逻辑。"""
+        """重试循环逻辑"""
         key = self._get_request_key(event)
         logger.warning(
-            f"[FinalRetryPlugin] 检测到可重试的错误 (原因: '{initial_reason}'), Key: {key}。准备重试(最多 {self.max_retries} 次)..."
+            f"检测到可重试的错误 (原因: '{initial_reason}'), Key: {key}准备重试(最多 {self.max_retries} 次)..."
         )
 
         delay = self.retry_delay
@@ -108,7 +112,7 @@ class FinalLLMRetryPlugin(Star):
                     delay = min(delay * 2, 30)
 
             logger.info(
-                f"[FinalRetryPlugin] 对请求 {key} 进行第 {retry_count}/{self.max_retries} 次重试..."
+                f"对请求 {key} 进行第 {retry_count}/{self.max_retries} 次重试..."
             )
 
             try:
@@ -116,23 +120,21 @@ class FinalLLMRetryPlugin(Star):
                 is_retry_failed, retry_reason = self._is_response_failed(new_response)
 
                 if not is_retry_failed:
-                    logger.info(f"[FinalRetryPlugin] 重试成功 (Key: {key})。")
+                    logger.info(f"重试成功 (Key: {key})")
                     return True, new_response
                 else:
                     logger.warning(
-                        f"[FinalRetryPlugin] 第 {retry_count} 次重试仍失败 (Key: {key}, 原因: {retry_reason})。"
+                        f"第 {retry_count} 次重试仍失败 (Key: {key}, 原因: {retry_reason})"
                     )
             except Exception as e:
-                logger.error(
-                    f"[FinalRetryPlugin] 第 {retry_count} 次重试时发生异常 (Key: {key}): {e}"
-                )
+                logger.error(f"第 {retry_count} 次重试时发生异常 (Key: {key}): {e}")
                 if retry_count >= self.max_retries:
                     logger.error(
-                        f"[FinalRetryPlugin] 已达到最大重试次数，且最后一次尝试时发生异常 {key}，终止。"
+                        f"已达到最大重试次数，且最后一次尝试时发生异常 {key}，终止"
                     )
                     return False, None
 
-        logger.error(f"[FinalRetryPlugin] 请求 {key} 已达到最大重试次数，放弃。")
+        logger.error(f"请求 {key} 已达到最大重试次数，放弃")
         return False, None
 
     @filter.on_decorating_result(priority=100)
@@ -194,7 +196,7 @@ class FinalLLMRetryPlugin(Star):
         )
 
         if is_success and new_response:
-            # 重试成功，用新响应的数据更新旧的响应对象
+            # 重试成功，更新旧的响应对象
             resp.role = new_response.role
             resp.completion_text = new_response.completion_text
             resp.raw_completion = new_response.raw_completion
@@ -209,5 +211,3 @@ class FinalLLMRetryPlugin(Star):
             # 通过修改resp内容为空让后续处理知道已经失败
             resp.completion_text = ""
             resp.raw_completion = None
-
-
