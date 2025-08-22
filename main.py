@@ -15,7 +15,7 @@ NORMAL_FINISH_REASONS = {"stop", "tool_calls"}
     "长安某",
     "一个基于事件钩子的、处理空回复和非完整响应的重试插件",
     "1.0.0",
-    "https://github.com",
+    "https://github.com/zgojin/astrbot_plugin_retry_v2",
 )
 class FinalLLMRetryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -209,3 +209,4 @@ class FinalLLMRetryPlugin(Star):
             # 通过修改resp内容为空让后续处理知道已经失败
             resp.completion_text = ""
             resp.raw_completion = None
+
