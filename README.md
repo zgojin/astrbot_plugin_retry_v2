@@ -1,6 +1,5 @@
 # astrbot_plugin_retry_v2
 重构后的基于事件钩子的、处理空回复和非完整响应的插件
-# AstrBot 智能重试插件 (astrbot_plugin_retry_v2)
 
 这是一个为 [AstrBot](https://github.com/Soulter/AstrBot) 设计的插件，旨在提高大型语言模型（LLM）响应的稳定性和可靠性。 当机器人从LLM收到的响应为空、不完整或包含特定错误信息时，此插件会自动进行重试，从而对用户屏蔽底层模型的瞬时故障。
 
