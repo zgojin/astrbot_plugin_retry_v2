@@ -26,7 +26,7 @@ NORMAL_FINISH_REASONS = {"stop", "tool_calls"}
     "astrbot_plugin_retry_v2",
     "长安某",
     "一个基于事件钩子的、处理空回复和截断等非完整响应的重试插件",
-    "1.0.0",
+    "1.0.1",
     "https://github.com/zgojin/astrbot_plugin_retry_v2",
 )
 class FinalLLMRetryPlugin(Star):
@@ -66,38 +66,72 @@ class FinalLLMRetryPlugin(Star):
             logger.debug(f"请求已成功处理并发送，清理备份 (Key: {key})")
 
     def _is_response_failed(self, resp: LLMResponse) -> tuple[bool, str]:
-        """检查 LLM 响应是否失败（兼容 OpenAI 和 Gemini）"""
+        """检查 LLM 响应"""
         raw_data = resp.raw_completion
 
         if raw_data is None:
             return True, "原始响应(raw_completion)为空"
 
         finish_reason_str = None
+        has_text_content = False
+        is_a_valid_tool_call = False
+
+        # 优先检查 resp.completion_text
+        if resp.completion_text and resp.completion_text.strip():
+            has_text_content = True
 
         # OpenAI 格式
         if ChatCompletion and isinstance(raw_data, ChatCompletion):
             if raw_data.choices:
-                finish_reason_str = getattr(raw_data.choices[0], "finish_reason", None)
+                choice = raw_data.choices[0]
+                finish_reason_str = getattr(choice, "finish_reason", None)
+                if getattr(choice.message, "tool_calls", None):
+                    is_a_valid_tool_call = True
+                if (
+                    choice.message
+                    and choice.message.content
+                    and choice.message.content.strip()
+                ):
+                    has_text_content = True
 
         # Gemini 格式
         elif GenerateContentResponse and isinstance(raw_data, GenerateContentResponse):
             if raw_data.candidates:
-                # Gemini 的 finish_reason 是 Enum 类型，需取其 .name
-                gemini_finish_reason = getattr(
-                    raw_data.candidates[0], "finish_reason", None
-                )
+                candidate = raw_data.candidates[0]
+                gemini_finish_reason = getattr(candidate, "finish_reason", None)
                 if gemini_finish_reason:
                     finish_reason_str = gemini_finish_reason.name.lower()
 
-        # 检查完成原因是否异常
+                if (
+                    hasattr(candidate, "content")
+                    and hasattr(candidate.content, "parts")
+                    and candidate.content.parts
+                ):
+                    for part in candidate.content.parts:
+                        if hasattr(part, "function_call") and getattr(
+                            part, "function_call", None
+                        ):
+                            is_a_valid_tool_call = True
+                        if (
+                            hasattr(part, "text")
+                            and getattr(part, "text", "")
+                            and part.text.strip()
+                        ):
+                            has_text_content = True
+
+        # 如果是工具调用，不判定为失败，交由框架处理。
+        if is_a_valid_tool_call:
+            return False, ""
+
+        # 如果完成原因异常且不是工具调用
         if finish_reason_str and finish_reason_str not in NORMAL_FINISH_REASONS:
             return True, f"完成原因异常({finish_reason_str})"
 
-        # 检查内容是否为空同时排除正常的工具调用情况
-        completion_text = resp.completion_text or ""
-        if not completion_text.strip() and not resp.tools_call_name:
-            return True, "响应内容为空且无工具调用"
+        # 没有文本内容，不是工具调用
+        if not has_text_content:
+            return True, "响应内容为空"
 
+        # 其他情况视为成功
         return False, ""
 
     async def _perform_retry(self, original_req: ProviderRequest) -> LLMResponse:
@@ -122,21 +156,11 @@ class FinalLLMRetryPlugin(Star):
             logger.warning("本次响应的 raw_completion 为 None")
         else:
             try:
-                # OpenAI 响应类型
-                if ChatCompletion and isinstance(raw_data, ChatCompletion):
+                if hasattr(raw_data, "model_dump_json"):
                     dumped_json = raw_data.model_dump_json(indent=2)
                     logger.info(
-                        f"检测到 OpenAI (ChatCompletion)，其内容如下:\n{dumped_json}"
+                        f"检测到 Pydantic 模型 ({type(raw_data).__name__})，其内容如下:\n{dumped_json}"
                     )
-                # Gemini 响应类型
-                elif GenerateContentResponse and isinstance(
-                    raw_data, GenerateContentResponse
-                ):
-                    dumped_json = raw_data.model_dump_json(indent=2)
-                    logger.info(
-                        f"检测到 Gemini (GenerateContentResponse)，其内容如下:\n{dumped_json}"
-                    )
-                # 其他情况的处理
                 elif isinstance(raw_data, (dict, list)):
                     pretty_json_str = json.dumps(raw_data, indent=2, ensure_ascii=False)
                     logger.info(f"检测到字典/列表，其内容如下:\n{pretty_json_str}")
@@ -232,7 +256,7 @@ class FinalLLMRetryPlugin(Star):
                 event.plain_result(self.fallback_reply.format(reason=initial_reason))
             )
 
-    @filter.on_llm_response(priority=-10)
+    @filter.on_llm_response(priority=10)
     async def retry_on_llm_failure(self, event: AstrMessageEvent, resp: LLMResponse):
         """基于响应触发重试"""
         key = self._get_request_key(event)
@@ -250,10 +274,8 @@ class FinalLLMRetryPlugin(Star):
         )
 
         if is_success and new_response:
-            # 重试成功，更新 resp 的属性
             resp.__dict__.update(new_response.__dict__)
         else:
-            # 重试最终失败，发送消息并彻底停止事件传播
             await event.send(
                 event.plain_result(self.fallback_reply.format(reason=reason))
             )
