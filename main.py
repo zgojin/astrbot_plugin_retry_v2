@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
@@ -6,7 +7,18 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 
-# 正常完成的标志
+try:
+    from openai.types.chat.chat_completion import ChatCompletion
+except ImportError:
+    ChatCompletion = None
+
+try:
+    from google.genai.types import GenerateContentResponse
+except ImportError:
+    GenerateContentResponse = None
+
+
+# 定义正常完成的标志
 NORMAL_FINISH_REASONS = {"stop", "tool_calls"}
 
 
@@ -26,17 +38,13 @@ class FinalLLMRetryPlugin(Star):
         self.retry_delay = self.config.get("retry_delay", 2)
         self.use_exponential_backoff = self.config.get("retry_delay_mode", True)
         self.fallback_reply = self.config.get(
-            "fallback_reply", "抱歉，请求多次失败({reason})，请稍后再试。"
+            "fallback_reply", "抱歉，请求多次失败({reason})，请稍后再试"
         )
-
-        default_keywords = [
-            "API 返回的内容为空",
-        ]
-        self.retry_keywords = self.config.get("retry_keywords", default_keywords)
-        logger.info("astrbot_plugin_retry_v2 [v8.2.0] 全配置版已加载。")
+        self.retry_keywords = self.config.get("retry_keywords", ["API 返回的内容为空"])
+        self.log_each_response = self.config.get("log_each_response", True)
+        logger.info("astrbot_plugin_retry_v2 全配置版已加载")
 
     def _get_request_key(self, event: AstrMessageEvent) -> str:
-        """获取用于追踪请求的唯一ID"""
         try:
             if event.message_obj and event.message_obj.message_id:
                 return str(event.message_obj.message_id)
@@ -46,39 +54,52 @@ class FinalLLMRetryPlugin(Star):
 
     @filter.on_llm_request()
     async def store_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """备份原始请求。"""
         key = self._get_request_key(event)
         self.pending_requests[key] = req
-        logger.debug(f"[FinalRetryPlugin] 已成功备份请求 (Key: {key})")
+        logger.debug(f"已成功备份请求 (Key: {key})")
 
     @filter.after_message_sent(priority=-100)
     async def cleanup_after_sent(self, event: AstrMessageEvent):
-        """当消息成功发送后，清理对应的请求备份，防止内存泄漏。"""
         key = self._get_request_key(event)
         if key in self.pending_requests:
             self.pending_requests.pop(key)
-            logger.debug(
-                f"[FinalRetryPlugin] 请求已成功处理并发送，清理备份 (Key: {key})"
-            )
+            logger.debug(f"请求已成功处理并发送，清理备份 (Key: {key})")
 
     def _is_response_failed(self, resp: LLMResponse) -> tuple[bool, str]:
-        """检查LLM响应是否失败。"""
-        if not resp or not resp.completion_text:
-            return True, "内容为空"
+        """检查 LLM 响应是否失败"""
+        raw_data = resp.raw_completion
 
-        finish_reason = None
-        if (
-            hasattr(resp, "raw_completion")
-            and hasattr(resp.raw_completion, "choices")
-            and resp.raw_completion.choices
-        ):
-            finish_reason = resp.raw_completion.choices[0].finish_reason
-            if finish_reason and finish_reason.lower() not in NORMAL_FINISH_REASONS:
-                return True, f"完成原因异常({finish_reason})"
+        if raw_data is None:
+            return True, "原始响应为空"
+
+        finish_reason_str = None
+
+        # OpenAI 格式
+        if ChatCompletion and isinstance(raw_data, ChatCompletion):
+            if raw_data.choices:
+                finish_reason_str = getattr(raw_data.choices[0], "finish_reason", None)
+
+        # Gemini 格式
+        elif GenerateContentResponse and isinstance(raw_data, GenerateContentResponse):
+            if raw_data.candidates:
+                gemini_finish_reason = getattr(
+                    raw_data.candidates[0], "finish_reason", None
+                )
+                if gemini_finish_reason:
+                    finish_reason_str = gemini_finish_reason.name.lower()
+
+        # 检查完成原因是否异常
+        if finish_reason_str and finish_reason_str not in NORMAL_FINISH_REASONS:
+            return True, f"完成原因异常({finish_reason_str})"
+
+        # 检查内容是否为空（同时排除正常的工具调用情况）
+        completion_text = resp.completion_text or ""
+        if not completion_text.strip() and not resp.tools_call_name:
+            return True, "响应内容为空且无工具调用"
+
         return False, ""
 
     async def _perform_retry(self, original_req: ProviderRequest) -> LLMResponse:
-        """执行一次LLM请求。"""
         return await self.context.get_using_provider().text_chat(
             prompt=original_req.prompt,
             contexts=original_req.contexts,
@@ -87,16 +108,55 @@ class FinalLLMRetryPlugin(Star):
             system_prompt=original_req.system_prompt,
         )
 
+    async def _log_response(self, resp: LLMResponse, key: str):
+        if not self.log_each_response:
+            return
+        logger.info("---------- 捕获到 LLM 响应 ----------")
+        logger.info(
+            f"LLMResponse (metadata): { {k: v for k, v in resp.__dict__.items() if k != 'raw_completion'} }"
+        )
+
+        raw_data = resp.raw_completion
+        if raw_data is None:
+            logger.warning("本次响应的 raw_completion 为 None")
+        else:
+            try:
+                # 精确检查 OpenAI 响应类型
+                if ChatCompletion and isinstance(raw_data, ChatCompletion):
+                    dumped_json = raw_data.model_dump_json(indent=2)
+                    logger.info(
+                        f"检测到 OpenAI 对象 (ChatCompletion)，其内容如下:\n{dumped_json}"
+                    )
+                # 精确检查 Gemini 响应类型
+                elif GenerateContentResponse and isinstance(
+                    raw_data, GenerateContentResponse
+                ):
+                    dumped_json = raw_data.model_dump_json(indent=2)
+                    logger.info(
+                        f"检测到 Gemini 对象 (GenerateContentResponse)，其内容如下:\n{dumped_json}"
+                    )
+                # 其他可能情况的处理
+                elif isinstance(raw_data, (dict, list)):
+                    pretty_json_str = json.dumps(raw_data, indent=2, ensure_ascii=False)
+                    logger.info(f"检测到字典/列表对象，其内容如下:\n{pretty_json_str}")
+                else:
+                    logger.info(
+                        f"raw_completion 类型: {type(raw_data)}, 内容如下:\n{str(raw_data)}"
+                    )
+            except Exception as e:
+                logger.error(f"打印 raw_completion 时出错: {e}", exc_info=True)
+                logger.info(f"尝试用 str() 强行打印 raw_completion:\n{str(raw_data)}")
+        logger.info("---------- 响应打印结束 ----------")
+
     async def _execute_retry_loop(
         self,
         event: AstrMessageEvent,
         original_req: ProviderRequest,
         initial_reason: str,
     ) -> tuple[bool, LLMResponse | None]:
-        """封装的重试循环逻辑。"""
         key = self._get_request_key(event)
         logger.warning(
-            f"[FinalRetryPlugin] 检测到可重试的错误 (原因: '{initial_reason}'), Key: {key}。准备重试(最多 {self.max_retries} 次)..."
+            f"检测到可重试的错误 (原因: '{initial_reason}'), Key: {key}准备重试(最多 {self.max_retries} 次)..."
         )
 
         delay = self.retry_delay
@@ -107,39 +167,34 @@ class FinalLLMRetryPlugin(Star):
                 if self.use_exponential_backoff:
                     delay = min(delay * 2, 30)
 
-            logger.info(
-                f"[FinalRetryPlugin] 对请求 {key} 进行第 {retry_count}/{self.max_retries} 次重试..."
-            )
+            logger.info(f"请求 {key} 第 {retry_count}/{self.max_retries} 次重试...")
 
             try:
                 new_response = await self._perform_retry(original_req)
+                await self._log_response(new_response, key)
                 is_retry_failed, retry_reason = self._is_response_failed(new_response)
 
                 if not is_retry_failed:
-                    logger.info(f"[FinalRetryPlugin] 重试成功 (Key: {key})。")
+                    logger.info(f"重试成功 (Key: {key})")
                     return True, new_response
                 else:
                     logger.warning(
-                        f"[FinalRetryPlugin] 第 {retry_count} 次重试仍失败 (Key: {key}, 原因: {retry_reason})。"
+                        f"第 {retry_count} 次重试仍失败 (Key: {key}, 原因: {retry_reason})"
                     )
             except Exception as e:
                 logger.error(
-                    f"[FinalRetryPlugin] 第 {retry_count} 次重试时发生异常 (Key: {key}): {e}"
+                    f"第 {retry_count} 次重试时发生异常 (Key: {key}): {e}",
+                    exc_info=True,
                 )
-                if retry_count >= self.max_retries:
-                    logger.error(
-                        f"[FinalRetryPlugin] 已达到最大重试次数，且最后一次尝试时发生异常 {key}，终止。"
-                    )
-                    return False, None
 
-        logger.error(f"[FinalRetryPlugin] 请求 {key} 已达到最大重试次数，放弃。")
+        logger.error(f"所有 {self.max_retries} 次重试均失败 (Key: {key})")
         return False, None
 
     @filter.on_decorating_result(priority=100)
     async def retry_on_exception_failure(self, event: AstrMessageEvent):
+        """在最终结果生成后，基于关键词触发重试"""
         key = self._get_request_key(event)
         original_req = self.pending_requests.get(key)
-
         if not original_req:
             return
 
@@ -164,14 +219,13 @@ class FinalLLMRetryPlugin(Star):
         if not trigger_keyword:
             return
 
-        # 调用封装的重试逻辑
         initial_reason = f"触发关键词: '{trigger_keyword}'"
         is_success, new_response = await self._execute_retry_loop(
             event, original_req, initial_reason
         )
 
         if is_success and new_response:
-            event.set_result(event.plain_result(new_response.completion_text))
+            event.set_result(new_response.result_chain)
         else:
             event.set_result(
                 event.plain_result(self.fallback_reply.format(reason=initial_reason))
@@ -179,12 +233,13 @@ class FinalLLMRetryPlugin(Star):
 
     @filter.on_llm_response(priority=-10)
     async def retry_on_llm_failure(self, event: AstrMessageEvent, resp: LLMResponse):
+        """在收到 LLM 响应后，基于响应对象本身的内容触发重试"""
         key = self._get_request_key(event)
         original_req = self.pending_requests.get(key)
-
         if not original_req:
             return
 
+        await self._log_response(resp, key)
         is_failed, reason = self._is_response_failed(resp)
         if not is_failed:
             return
@@ -194,19 +249,17 @@ class FinalLLMRetryPlugin(Star):
         )
 
         if is_success and new_response:
-            # 重试成功，用新响应的数据更新旧的响应对象
+            # 重试成功，修改传入的 resp 对象，使其对后续的处理流程生效
             resp.role = new_response.role
             resp.completion_text = new_response.completion_text
             resp.raw_completion = new_response.raw_completion
             resp.tools_call_args = new_response.tools_call_args
             resp.tools_call_name = new_response.tools_call_name
             resp.result_chain = new_response.result_chain
+            resp.is_chunk = new_response.is_chunk
         else:
-            # 重试最终失败，发送fallback消息并阻止后续处理
+            # 重试最终失败，发送消息并彻底停止事件传播
             await event.send(
                 event.plain_result(self.fallback_reply.format(reason=reason))
             )
-            # 通过修改resp内容为空让后续处理知道已经失败
-            resp.completion_text = ""
-            resp.raw_completion = None
-
+            event.stop_event()
